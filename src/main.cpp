@@ -49,6 +49,7 @@ void setup()
 {
     Serial.begin(115200); // Serial for debugging
     SPI.begin(LCD_SCK, LCD_MISO, LCD_MOSI);
+    u8g2.setBusClock(8000000); // 8 MHz
     u8g2.begin();
     u8g2.setContrast(255);
     u8g2.clearBuffer();
@@ -62,10 +63,9 @@ void setup()
     RGB.setPixelColor(2, RGB.Color(255, 0, 255));
     RGB.setPixelColor(1, RGB.Color(255, 0, 255));
     RGB.show();
-    // Wire.setClock(400000); // 400kHz instead of default 100kHz
     Wire.begin(I2C_ADDRESS, SDA_PIN, SCL_PIN, 3400000);
     Wire.onReceive(receiveEvent);
-    // Wire.onRequest(requestEvent);
+    Wire.onRequest(requestEvent);
     Serial.println("I2C OLED Display Initialized");
 }
 
@@ -98,12 +98,28 @@ void loop()
         i2cCommandReceived = false; // Reset flag for next loop
     }
 }
+volatile uint8_t lastCommand = 0;
+
 
 void requestEvent()
 {
-    // Default response is 0xFF for read commands
-    // This matches typical OLED display behavior
-    Wire.write(0xFF);
+    uint8_t response = 0xFF;  // Default response
+    
+    // Check status register responses
+    switch(lastCommand) {
+        case 0x00: // Status read
+            response = 0x98;  // Ready, not busy
+            break;
+        case 0x01: // Power mode read
+            response = displayEnabled ? 0x01 : 0x00;
+            break;
+        default:
+            response = 0xFF;
+    }
+    
+    Serial.printf("I2C Request - Last cmd: 0x%02X, Responding: 0x%02X\n", 
+                 lastCommand, response);
+    Wire.write(response);
 }
 
 // Modify receiveEvent to track read commands:
@@ -111,39 +127,43 @@ void requestEvent()
 void receiveEvent(int howMany)
 {
     noInterrupts();
-
-    if (lcdBufferIndex + howMany >= LCD_BUFFER_SIZE)
-    {
-        lcdBufferIndex = 0;
-    }
+    static bool expectingCommand = false;
 
     while (Wire.available() && lcdBufferIndex < LCD_BUFFER_SIZE)
     {
         uint8_t data = Wire.read();
-        if (data == 0xAE)
-        {
-            if (displayEnabled == true)
-            {
-            displayOff = true;  // Set flag instead of direct control
+        
+        // Check for command control byte
+        if (data == 0x00) {
+            expectingCommand = true;
+            lcdBuffer[lcdBufferIndex++] = data;
+            continue;
+        }
+        
+        // If we're expecting a command, check for display commands
+        if (expectingCommand) {
+            lastCommand = data;  // Track command for request responses
+            if (data == 0xAE && displayEnabled) {
+                displayOff = true;
+                Serial.println("OFF command received directly");
             }
-        }
-        else if (data == 0xAF)
-        {
-            if (displayEnabled == false)
-            {
-            displayOn = true;   // Set flag instead of direct control
+            else if (data == 0xAF && !displayEnabled) {
+                displayOn = true;
+                Serial.println("ON command received directly");
             }
+            expectingCommand = false;
         }
-        else if (data == 0xA6 || data == 0xA7) // Normal or Inverted display
-        {
-            // Handle display mode changes if needed
+        
+        // Store the byte regardless
+        if (lcdBufferIndex < LCD_BUFFER_SIZE) {
+            lcdBuffer[lcdBufferIndex++] = data;
         }
-        lcdBuffer[lcdBufferIndex++] = data;
     }
 
     i2cCommandReceived = true;
     interrupts();
 }
+
 struct DisplayState
 {
     uint8_t frame[1024];
@@ -167,8 +187,6 @@ struct DisplayState
     bool charge_pump_enabled; // Charge pump state
     uint32_t last_frame_time; // For frame timing
 };
-
-bool frameReady = false; // Flag to indicate if a frame is ready to be rendered
 
 
 void processCommands(DisplayState &state, uint16_t &i)
@@ -219,12 +237,17 @@ void processCommands(DisplayState &state, uint16_t &i)
             break;
         case 0xAE: // Display OFF
             // Serial.println("Display OFF command received");
+            if (displayEnabled == true)
+            {
             displayOff = true;  // Set flag instead of direct control
+            }
             break;
         case 0xAF: // Display ON
             // Serial.println("Display ON command received");
+            if (displayEnabled == false)
+            {
             displayOn = true;   // Set flag instead of direct control
-            frameReady = true;  // Indicate a frame is ready to be rendered
+            }
             break;
                         
         case 0xA6: // Normal display mode
@@ -295,52 +318,6 @@ void processCommands(DisplayState &state, uint16_t &i)
             }
             break;
         }
-    }
-}
-
-void processCommand(uint8_t command)
-{
-    switch (command)
-    {
-    case 0xAE: // Display OFF
-        Serial.println("Display OFF command received");
-        displayOff = true;  // Set flag instead of direct control
-        break;
-    case 0xAF: // Display ON
-        Serial.println("Display ON command received");
-        displayOn = true;   // Set flag instead of direct control
-        frameReady = true;  // Indicate a frame is ready to be rendered
-        break;
-    case 0xA6: // Normal display mode
-        Serial.println("Normal display mode");
-        break;
-    case 0xA7: // Inverted display mode
-        Serial.println("Inverted display mode");
-        break;
-    case 0xD5: // Set Clock Divide Ratio/Oscillator Frequency
-        Serial.println("Set Clock Divide Ratio/Oscillator Frequency command received");
-        // Handle clock divide ratio and oscillator frequency settings
-        break;
-    case 0xA8: // Set Multiplex Ratio
-        Serial.println("Set Multiplex Ratio command received");
-        // Handle multiplex ratio settings
-        break;
-    case 0x8D: // Charge Pump Setting
-        Serial.println("Charge Pump Setting command received");
-        // Handle charge pump settings
-        break;
-    case 0x81: // Set Contrast
-        Serial.println("Set Contrast command received");
-        // Handle contrast settings
-        break;
-    case 0xD3: // Set Display Offset
-        Serial.println("Set Display Offset command received");
-        // Handle display offset settings
-        break;
-    default:
-        Serial.printf("Unknown command: 0x%02X\n", command);
-        // Handle unknown commands if necessary
-        break;
     }
 }
 
@@ -436,7 +413,7 @@ void processLcdBuffer()
         }
     }
 
-    if (state.index == 1024 || frameReady)
+    if (state.index == 1024)
     {
         DisplayState* taskState = new DisplayState(state);
 
@@ -451,7 +428,6 @@ void processLcdBuffer()
         );
 
         state.index = 0;
-        frameReady = false;
     }
 
     lcdBufferIndex = 0;
